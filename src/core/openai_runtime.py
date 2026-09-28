@@ -49,9 +49,11 @@ class OpenAIRunner:
     def _client(self):
         from openai import OpenAI
 
-        return OpenAI(**(self.client_kwargs or {}))
+        return OpenAI(**{"timeout": 45.0, "max_retries": 1, **(self.client_kwargs or {})})
 
-    async def chat(self, agent: OpenAIAgent, user_message: str) -> str:
+    async def chat(self, agent: OpenAIAgent, user_message: str, *, history=None) -> str:
+        if history is not None and len(history) > 32:
+            raise ValueError("Conversation exceeds the lab turn budget")
         for hook in self.input_hooks:
             blocked = hook(user_message)
             if blocked:
@@ -62,20 +64,41 @@ class OpenAIRunner:
             return block_msg
 
         client = self._client()
-        completion = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": agent.instruction},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=self.temperature,
-        )
+        from openai import NotFoundError
+        messages = [
+            {"role": "system", "content": agent.instruction},
+            *(history or []),
+            {"role": "user", "content": user_message},
+        ]
+        try:
+            try:
+                completion = client.chat.completions.create(
+                    model=self.model, messages=messages, temperature=self.temperature, max_tokens=512,
+                )
+            except NotFoundError:
+                # OpenRouter currently lists only the :free route for the SAME
+                # locked Blue model. No fallback to a different model/provider.
+                if self.provider != "openrouter" or self.model != get_blue_model():
+                    raise
+                route = get_blue_model() + ":free"
+                completion = client.chat.completions.create(
+                    model=route, messages=messages, temperature=self.temperature, max_tokens=512,
+                )
+                self.model = route
+                print(f"Blue routing compatibility: using {route}")
+        finally:
+            client.close()
         text = (completion.choices[0].message.content or "").strip()
 
         for hook in self.output_hooks:
             text = hook(text)
 
         text = await self._run_output_plugins(text)
+        if history is not None:
+            history.extend([
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": text},
+            ])
         return text
 
     async def _run_input_plugins(self, user_message: str) -> str | None:

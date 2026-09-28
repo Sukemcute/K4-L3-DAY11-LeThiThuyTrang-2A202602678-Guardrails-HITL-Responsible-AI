@@ -1,5 +1,7 @@
 from guardrails.input_guardrails import (
     InputStatus,
+    InputIntent,
+    classify_input_intent,
     detect_injection,
     topic_filter,
     InputGuardrailPlugin,

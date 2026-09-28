@@ -5,7 +5,9 @@ Checkpoint 2 — Output Guardrails
   - LLM-as-Judge                          ← optional (không chấm)
 """
 import re
-import textwrap
+import base64
+import json
+import unicodedata
 
 from google.genai import types
 from google.adk.agents import llm_agent
@@ -13,6 +15,63 @@ from google.adk import runners
 from google.adk.plugins import base_plugin
 
 from core.utils import chat_with_agent
+from core.config import load_protected_payload
+
+
+_PII_PATTERNS = {
+    "phone": re.compile(r"(?<!\w)(?:0|\+84)[ .-]?(?:\d[ .-]?){8,9}\d(?!\w)"),
+    "email": re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+", re.I),
+    "national_id": re.compile(r"(?<!\w)(?:\d{12}|\d{9})(?!\w)"),
+    "api_key": re.compile(r"(?<!\w)sk-[a-z0-9_-]{8,}(?!\w)", re.I),
+    "password": re.compile(
+        r"\b(?:password|mật\s*khẩu)\s*[\"']?\s*[:=]\s*[\"']?(?P<value>[^\s\"',;<>}]+)", re.I
+    ),
+    "db_host": re.compile(r"\b(?:[a-z0-9-]+\.)+internal\b(?::\d+)?", re.I),
+}
+
+# Follow the protected fixture so moving the implementation to a new class repo
+# does not silently retain only this class's literal demo credentials.
+_PROTECTED = load_protected_payload()
+_SECRET_CATEGORY = {"admin_password": "password", "api_key": "api_key", "db_host": "db_host"}
+_KNOWN_SECRETS = tuple(
+    (_SECRET_CATEGORY.get(target["id"], "secret"), str(value))
+    for target in _PROTECTED["leak_targets"]
+    for value in {target["value"], *target.get("match_substrings", [])}
+    if value
+)
+_ENCODED_SECRETS = tuple(
+    (category, encoded)
+    for category, value in _KNOWN_SECRETS
+    for encoded in (base64.b64encode(value.encode()).decode(), value.encode().hex())
+)
+
+
+def _matching_view(text: str) -> tuple[str, list[int]]:
+    """Map normalized characters back to source offsets for exact redaction.
+
+    Keep clean responses byte-for-byte; only the matching view is normalized.
+    A span covers any invisible characters between its visible endpoints.
+    """
+    chars, offsets = [], []
+    for index, char in enumerate(text):
+        for normalized in unicodedata.normalize("NFKC", char):
+            if unicodedata.category(normalized) != "Cf":
+                chars.append(normalized)
+                offsets.append(index)
+    return "".join(chars), offsets
+
+
+def _argument_texts(value):
+    """Inspect decoded argument strings too (JSON escapes can hide separators)."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield str(key)
+            yield from _argument_texts(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _argument_texts(item)
 
 
 # ============================================================
@@ -28,7 +87,7 @@ from core.utils import chat_with_agent
 # ============================================================
 
 def content_filter(response: str) -> dict:
-    """Filter response for PII, secrets, and harmful content.
+    """Redact recognized PII and secrets (not a semantic safety classifier).
 
     Args:
         response: The LLM's response text
@@ -36,24 +95,54 @@ def content_filter(response: str) -> dict:
     Returns:
         dict with 'safe', 'issues', and 'redacted' keys
     """
-    issues = []
-    redacted = response
+    view, offsets = _matching_view(response)
+    findings: dict[str, set[tuple[int, int]]] = {}
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
+    def add(category, start, end, index_map):
+        findings.setdefault(category, set()).add((index_map[start], index_map[end - 1] + 1))
 
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
-        if matches:
-            issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+    for category, pattern in _PII_PATTERNS.items():
+        for match in pattern.finditer(view):
+            start, end = match.span("value") if category == "password" else match.span()
+            # Re-filtering a previously sanitized message must be idempotent.
+            if view[start:end] != "[REDACTED]":
+                add(category, start, end, offsets)
+
+    # Recognize demo credentials even when separated by punctuation/whitespace.
+    compact_chars, compact_offsets = [], []
+    for index, char in enumerate(view):
+        if char.isascii() and char.isalnum():
+            compact_chars.append(char.lower())
+            compact_offsets.append(offsets[index])
+    compact = "".join(compact_chars)
+    for category, secret in _KNOWN_SECRETS:
+        needle = re.sub(r"[^a-z0-9]", "", secret.lower())
+        if needle:
+            for match in re.finditer(re.escape(needle), compact):
+                add(category, *match.span(), compact_offsets)
+
+    # Exact encodings of known fixtures only; arbitrary encoded data and
+    # multi-turn reconstruction still require additional security boundaries.
+    for category, encoded in _ENCODED_SECRETS:
+        for match in re.finditer(re.escape(encoded), view):
+            add(category, *match.span(), offsets)
+
+    # Merge overlapping phone/ID/secret spans so no tail survives redaction.
+    spans = sorted({span for matches in findings.values() for span in matches})
+    merged = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    chunks, previous = [], 0
+    for start, end in merged:
+        chunks.extend((response[previous:start], "[REDACTED]"))
+        previous = end
+    chunks.append(response[previous:])
+    redacted = "".join(chunks)
+    # Only categories/counts enter diagnostics, never the matching secret value.
+    issues = [f"{category}: {len(matches)} found" for category, matches in sorted(findings.items())]
 
     return {
         "safe": len(issues) == 0,
@@ -154,7 +243,7 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         """Extract text from LLM response."""
         text = ""
         if hasattr(llm_response, "content") and llm_response.content:
-            for part in llm_response.content.parts:
+            for part in llm_response.content.parts or []:
                 if hasattr(part, "text") and part.text:
                     text += part.text
         return text
@@ -168,20 +257,55 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         """Check LLM response before sending to user."""
         self.total_count += 1
 
+        # A fragment can split a secret across callbacks ("admin" + "123").
+        # This text lab uses complete responses: suppress all partial content
+        # and inspect the full response that the ADK streaming contract supplies.
+        if getattr(llm_response, "partial", False):
+            llm_response.content = types.Content(role="model", parts=[])
+            return llm_response
+
+        parts = getattr(getattr(llm_response, "content", None), "parts", None) or []
+        for part in parts:
+            call = getattr(part, "function_call", None)
+            call_texts = (
+                [json.dumps(call.model_dump(), ensure_ascii=False), *_argument_texts(call.args)]
+                if call else []
+            )
+            if any(not content_filter(text)["safe"] for text in call_texts):
+                self.blocked_count += 1
+                llm_response.content = types.Content(role="model", parts=[types.Part.from_text(
+                    text="Không thể gửi dữ liệu nhạy cảm qua công cụ."
+                )])
+                return llm_response
+
         response_text = self._extract_text(llm_response)
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            # Rebuild a text-only response: don't forward calls attached to an
+            # unsafe answer. Clean responses retain their original parts.
+            llm_response.content = types.Content(role="model", parts=[
+                types.Part.from_text(text=result["redacted"])
+            ])
+            if any(getattr(part, "function_call", None) for part in parts):
+                self.blocked_count += 1
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            # Do not send recognized credentials to a separate judge service.
+            try:
+                verdict = await llm_safety_check(result["redacted"])
+                safe = verdict.get("safe") is True
+            except Exception:
+                safe = False
+            if not safe:
+                self.blocked_count += 1
+                llm_response.content = types.Content(role="model", parts=[types.Part.from_text(
+                    text="Không thể cung cấp câu trả lời này sau bước kiểm tra an toàn."
+                )])
+        return llm_response
 
 
 # ============================================================

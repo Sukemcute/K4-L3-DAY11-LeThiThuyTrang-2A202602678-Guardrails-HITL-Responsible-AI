@@ -111,6 +111,9 @@ async def part4_attacks():
         ai_attacks=None,
     )
 
+    if any(row.get("error") for row in unsafe_results + guards_results):
+        raise RuntimeError("CP4 contains provider errors. Inspect attack artifacts and rerun before submission.")
+
     red_leaks = sum(1 for r in unsafe_results if r.get("leaked"))
     bonus_leaks = sum(1 for r in guards_results if r.get("leaked"))
     print("\n" + "=" * 60)
@@ -134,10 +137,12 @@ async def part4_attacks():
 
 
 async def main(parts=None):
-    setup_api_key()
-
     if parts is None:
         parts = [2, 3, 4]  # Core: CP2 → CP3 → CP4
+
+    # CP2 runs deterministic local checks only; no provider credentials needed.
+    if any(part in (3, 4) for part in parts):
+        setup_api_key()
 
     for part in parts:
         if part == 2:
@@ -150,11 +155,15 @@ async def main(parts=None):
             print(f"Unknown part: {part}. Dùng --part 2, 3, hoặc 4.")
 
     print("\n" + "=" * 60)
-    print("Lab 11 complete! Check your results above.")
+    print("Requested checkpoints finished. Check outputs and run scripts/grade.py before submission.")
     print("=" * 60)
 
 
 if __name__ == "__main__":
+    # Windows redirected consoles may default to cp1252; lab messages contain VI.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(
         description=(
             "Lab 11: Guardrails / HITL / Red Team — "

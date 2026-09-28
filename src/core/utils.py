@@ -12,8 +12,9 @@ async def chat_with_agent(agent, runner, user_message: str, session_id=None):
     """
     provider = getattr(runner, "provider", None)
     if isinstance(runner, OpenAIRunner) or provider in ("openrouter", "openai"):
-        text = await runner.chat(agent, user_message)
-        return text, None
+        history = session_id if isinstance(session_id, list) else []
+        text = await runner.chat(agent, user_message, history=history)
+        return text, history
 
     from google.genai import types
 

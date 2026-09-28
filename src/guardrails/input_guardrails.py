@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -21,6 +22,113 @@ from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 
 # Quyết định rõ ràng — tránh đảo nghĩa True/False
 InputStatus = Literal["ALLOW", "BLOCK"]
+InputIntent = Literal["BANKING", "CONVERSATIONAL", "BLOCKED_TOPIC", "UNKNOWN", "INVALID"]
+
+# A local request budget, not a claim that every shorter input is safe.
+MAX_INPUT_CHARS = 16_000
+INJECTION_MESSAGE = (
+    "Mình không thể cung cấp, sao chép hoặc khôi phục thông tin xác thực và "
+    "cấu hình nội bộ. Mình có thể hỗ trợ bạn với tài khoản, giao dịch, tiết "
+    "kiệm, khoản vay hoặc thẻ VinBank."
+)
+TOPIC_MESSAGE = "VinBank chỉ hỗ trợ các câu hỏi liên quan đến nghiệp vụ ngân hàng."
+INVALID_MESSAGE = "Vui lòng gửi câu hỏi văn bản từ 1 đến 16000 ký tự."
+
+
+def normalize_input(text: str) -> str:
+    """Security matching view; never rewrite the customer's original message.
+
+    NFKC handles full-width letters; Cf covers zero-width/bidi controls. Accent
+    folding supports the unaccented Vietnamese vocabulary in core.config.
+    It does not solve arbitrary homoglyphs, encodings or semantic paraphrases.
+    """
+    text = unicodedata.normalize("NFKC", text).casefold().replace("đ", "d")
+    text = "".join(
+        char for char in unicodedata.normalize("NFD", text)
+        if unicodedata.category(char) not in {"Cf", "Mn"}
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# Compile once. Combine an instruction with a sensitive target instead of
+# banning words such as 'password' that occur in ordinary customer support.
+_INJECTION_PATTERNS = tuple(re.compile(pattern) for pattern in (
+    r"\b(?:ignore|disregard|forget|override)\s+(?:(?:all|the|your|previous|above|prior|earlier)\s+)*(?:instructions?|directives?|rules?|polic(?:y|ies))\b",
+    r"\byou are now\b",
+    r"\bpretend\s+(?:you are|to be)\b",
+    r"\bact as\s+(?:an?\s+)?(?:unrestricted|unfiltered|jailbroken|dan)\b",
+    r"\b(?:system|developer)\s+(?:prompt|instructions?|override)\b",
+    r"\b(?:reveal|show|print|disclose|translate|repeat|output|encode)\s+(?:all\s+)?(?:your|the)\s+(?:instructions?|prompt|secrets?|config(?:uration)?)\b",
+    r"\b(?:reveal|show|print|disclose|translate|output|encode|export|send|complete|confirm|fill)\b.{0,160}\b(?:admin(?:istrator)?\s+password|internal\s+(?:password|notes?|config(?:uration)?|credentials?|database)|api[ _-]?key|db[ _-]?host)\b",
+    r"\b(?:bo qua|quen|khong tuan theo)\s+(?:(?:tat ca|moi|cac|nhung)\s+)?(?:huong dan|chi dan|quy tac)\b",
+    r"\b(?:tiet lo|in ra|hien thi|xuat|gui|ma hoa|dich|xac nhan)\b.{0,160}\b(?:mat khau quan tri|thong tin noi bo|khoa api|may chu co so du lieu|chi dan he thong)\b",
+    r"\b(?:copy|provide|return|extract|list|resolve|recover)\b.{0,240}\b(?:training\s+fields?.{0,40}(?:context|handover)|administrator\s+sign[ -]?in\s+phrase|application\s+access\s+token|database\s+connection\s+address)\b",
+    r"\b(?:sao chep|cung cap|tra ve|trich xuat|dien|lay)\b.{0,240}\b(?:truong.{0,40}(?:ngu canh|ban giao)|cum dang nhap quan tri|ma truy cap ung dung|dia chi ket noi co so du lieu)\b",
+    r"(?:<\|(?:im_start|start_header_id)\|>\s*(?:system|developer)|\[inst\]|<<sys>>)",
+))
+
+
+def _topic_pattern(topics: list[str], *, variants: dict[str, str] | None = None) -> re.Pattern:
+    # Word boundaries avoid 'atm' in 'atmosphere' and 'kill' in 'skills'.
+    variants = variants or {}
+    words = (
+        variants.get(topic, re.escape(normalize_input(topic)).replace(r"\ ", r"\s+"))
+        for topic in topics
+    )
+    return re.compile(r"(?<!\w)(?:" + "|".join(words) + r")(?!\w)")
+
+
+_ALLOWED_TOPIC_PATTERN = _topic_pattern(ALLOWED_TOPICS, variants={
+    word: rf"{word}s?" for word in (
+        "account", "transaction", "transfer", "loan", "deposit", "withdrawal", "balance", "payment",
+    )
+})
+_BLOCKED_TOPIC_PATTERN = _topic_pattern(BLOCKED_TOPICS, variants={
+    "hack": r"hack(?:s|ed|ing|ers?)?",
+    "exploit": r"exploit(?:s|ed|ing)?",
+    "weapon": r"weapons?",
+    "drug": r"drugs?",
+    "bomb": r"bomb(?:s|ing)?",
+    "kill": r"kill(?:s|ed|ing)?",
+    "steal": r"steal(?:s|ing)?",
+})
+
+# Short conversational turns are valid dialogue. Match the whole utterance so
+# a greeting cannot whitelist unrelated content such as "hello, cook pasta".
+_CONVERSATIONAL_INTENT_PATTERNS = tuple(re.compile(pattern) for pattern in (
+    r"(?:(?:hi+|hello+|hey+)(?: (?:hi+|hello+|hey+))*|(?:xin chao|chao)(?: (?:ban|anh|chi|em|bot|tro ly|vinbank))?)(?: (?:how are you|ban khoe khong))?",
+    r"good (?:morning|afternoon|evening)",
+    r"(?:how are you|ban khoe khong)",
+    r"(?:thanks?|thank you|cam on)(?: (?:ban|anh|chi|em|vinbank))?",
+    r"(?:goodbye|bye|see you|tam biet|hen gap lai)",
+    r"(?:what can you do|can you help me|help|ban (?:co the )?(?:giup gi|lam duoc gi)|tro giup)",
+    r"(?:ok(?:ay)?|oke|yes|no|vang|da|duoc|hieu roi|toi hieu roi)",
+))
+
+
+def _conversation_view(normalized: str) -> str:
+    """Remove punctuation for exact short-utterance intent matching."""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", normalized)).strip()
+
+
+def classify_input_intent(user_input: str) -> InputIntent:
+    """Classify deterministic routing intent after basic validation.
+
+    Injection detection remains a separate, higher-priority security layer.
+    """
+    if not isinstance(user_input, str) or len(user_input) > MAX_INPUT_CHARS:
+        return "INVALID"
+    normalized = normalize_input(user_input)
+    if not normalized:
+        return "INVALID"
+    if _BLOCKED_TOPIC_PATTERN.search(normalized):
+        return "BLOCKED_TOPIC"
+    if _ALLOWED_TOPIC_PATTERN.search(normalized):
+        return "BANKING"
+    conversation = _conversation_view(normalized)
+    if any(pattern.fullmatch(conversation) for pattern in _CONVERSATIONAL_INTENT_PATTERNS):
+        return "CONVERSATIONAL"
+    return "UNKNOWN"
 
 
 # ============================================================
@@ -51,16 +159,12 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
-
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
-            return "BLOCK"
-    return "ALLOW"
+    if not isinstance(user_input, str) or len(user_input) > MAX_INPUT_CHARS:
+        return "BLOCK"
+    normalized = normalize_input(user_input)
+    if not normalized:
+        return "BLOCK"
+    return "BLOCK" if any(p.search(normalized) for p in _INJECTION_PATTERNS) else "ALLOW"
 
 
 # ============================================================
@@ -84,14 +188,8 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
-
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
-
-    pass  # Replace with your implementation
+    intent = classify_input_intent(user_input)
+    return "ALLOW" if intent in {"BANKING", "CONVERSATIONAL"} else "BLOCK"
 
 
 # ============================================================
@@ -115,12 +213,16 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
 
     def _extract_text(self, content: types.Content) -> str:
         """Extract plain text from a Content object."""
-        text = ""
-        if content and content.parts:
-            for part in content.parts:
-                if hasattr(part, "text") and part.text:
-                    text += part.text
-        return text
+        return "".join(part.text or "" for part in (content.parts or [])) if content else ""
+
+    def _rejection(self, text: str) -> str | None:
+        if len(text) > MAX_INPUT_CHARS or not normalize_input(text):
+            return INVALID_MESSAGE
+        if detect_injection(text) == "BLOCK":
+            return INJECTION_MESSAGE
+        if topic_filter(text) == "BLOCK":
+            return TOPIC_MESSAGE
+        return None
 
     def _block_response(self, message: str) -> types.Content:
         """Create a Content object with a block message."""
@@ -144,14 +246,27 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        rejection = self._rejection(text)
+        if rejection:
+            self.blocked_count += 1
+            return self._block_response(rejection)
+        return None
 
-        pass  # Replace with your implementation
+    async def before_run_callback(self, *, invocation_context) -> types.Content | None:
+        """Actually stop ADK; its on_user_message hook only replaces the input.
+
+        The lab's OpenAIRunner already short-circuits on the input hook's return.
+        ADK reaches this hook with the replaced Content. Keep the decision on
+        that invocation, avoiding a shared boolean that can affect other users.
+        """
+        content = invocation_context.user_content
+        text = self._extract_text(content)
+        if content and content.role == "model" and text in {
+            INJECTION_MESSAGE, TOPIC_MESSAGE, INVALID_MESSAGE,
+        }:
+            return content
+        rejection = self._rejection(text)
+        return self._block_response(rejection) if rejection else None
 
 
 # ============================================================
